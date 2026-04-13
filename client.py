@@ -1,75 +1,103 @@
 import socket
 import time
+import threading
 from datetime import datetime
 
-# --- ANSI Color Codes ---
+# --- ANSI Colors ---
 RESET = "\033[0m"
 INFO = "\033[94m"    # Blue
 SUCCESS = "\033[92m" # Green
 WARNING = "\033[93m" # Yellow
 ERROR = "\033[91m"   # Red
 
+# --- Config ---
+WINDOW_SIZE = 4
+TIMEOUT = 2.0
+
+# --- Global State Variables for Threading ---
+send_base = 0
+next_seq_num = 0
+lock = threading.Lock()
+
+messages = [f"Payload Data Block {i}" for i in range(10)]
+num_packets = len(messages)
+
+ack_status = [False] * num_packets
+send_times = [0.0] * num_packets
+
 def log(level, message):
-    """Prints a timestamped, color-coded log message."""
     timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     print(f"[{timestamp}] {level}{message}{RESET}")
 
 def compute_checksum(data):
-    """Computes a simple checksum by summing the ASCII values of the characters."""
     return sum(ord(c) for c in data) % 256
 
+def listen_for_acks(sock):
+    """Background thread to listen for incoming ACKs asynchronously."""
+    global send_base
+    while send_base < num_packets:
+        try:
+            # Non-blocking wait for ACKs
+            ack_packet, _ = sock.recvfrom(1024)
+            ack_seq = int(ack_packet.decode())
+            
+            with lock:
+                if send_base <= ack_seq < send_base + WINDOW_SIZE:
+                    if not ack_status[ack_seq]:
+                        log(SUCCESS, f"<-- [CLIENT] Received ACK {ack_seq}")
+                        ack_status[ack_seq] = True
+
+                        # Slide window forward if the base packet is ACKed
+                        while send_base < num_packets and ack_status[send_base]:
+                            send_base += 1
+                            log(INFO, f"*** Client Window Slid to Base: {send_base} ***")
+        except socket.timeout:
+            continue
+
 def start_client():
+    global send_base, next_seq_num
+    
     server_address = ('localhost', 12000)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    
-    # RDT Timer: Wait 2 seconds before assuming packet/ACK is lost
-    TIMEOUT = 2.0
-    sock.settimeout(TIMEOUT) 
+    sock.settimeout(0.5) # Short timeout for the listen thread to periodically yield
 
-    messages = [
-        "Project Initialized.", 
-        "Sending crucial payload data.", 
-        "Network integrity looks questionable.", 
-        "Final message: Terminating connection."
-    ]
-    
-    seq_num = 0
+    # Start the background listening thread
+    listener_thread = threading.Thread(target=listen_for_acks, args=(sock,), daemon=True)
+    listener_thread.start()
 
-    log(INFO, f"RDT 3.0 Client preparing to send {len(messages)} messages...")
+    log(INFO, f"Selective Repeat Client starting. Sending {num_packets} packets.")
     print("-" * 60)
 
-    for msg in messages:
-        # Create Checksum and Packet
-        checksum = compute_checksum(msg)
-        packet = f"{seq_num}|{checksum}|{msg}".encode()
-        
-        acked = False
-        attempt = 1
-
-        while not acked:
-            try:
-                log(INFO, f"[CLIENT] Attempt {attempt} - Sending: SEQ {seq_num} | CHK {checksum} | Data: '{msg}'")
+    # Main Sending/Timeout Loop
+    while send_base < num_packets:
+        with lock:
+            # 1. Send new packets if the window has space
+            while next_seq_num < send_base + WINDOW_SIZE and next_seq_num < num_packets:
+                msg = messages[next_seq_num]
+                chk = compute_checksum(msg)
+                packet = f"{next_seq_num}|{chk}|{msg}".encode()
+                
+                log(INFO, f"--> [CLIENT] Sending SEQ {next_seq_num}")
                 sock.sendto(packet, server_address)
+                send_times[next_seq_num] = time.time()
+                next_seq_num += 1
 
-                # Wait for ACK
-                ack_packet, _ = sock.recvfrom(1024)
-                ack_seq = int(ack_packet.decode())
+            # 2. Check for Timeouts on unacknowledged packets
+            for i in range(send_base, next_seq_num):
+                if not ack_status[i]:
+                    if (time.time() - send_times[i]) > TIMEOUT:
+                        log(ERROR, f"[!] TIMEOUT for SEQ {i}. Retransmitting specifically SEQ {i}...")
+                        msg = messages[i]
+                        chk = compute_checksum(msg)
+                        packet = f"{i}|{chk}|{msg}".encode()
+                        sock.sendto(packet, server_address)
+                        send_times[i] = time.time() # Reset timer for this specific packet
 
-                # Validate ACK
-                if ack_seq == seq_num:
-                    log(SUCCESS, f"[CLIENT] Received valid ACK {ack_seq}.")
-                    print("-" * 60)
-                    acked = True
-                    seq_num = 1 - seq_num # Toggle sequence number
-                else:
-                    log(WARNING, f"[CLIENT] Received out-of-order ACK {ack_seq}. Still waiting for ACK {seq_num}.")
+        time.sleep(0.1) # Small delay to prevent CPU maxing out while looping
 
-            except socket.timeout:
-                log(ERROR, f"[CLIENT] TIMEOUT! No valid ACK received for SEQ {seq_num} within {TIMEOUT}s. Retransmitting...")
-                attempt += 1
-
+    listener_thread.join(timeout=1.0)
     sock.close()
-    log(SUCCESS, "All data transferred reliably! Client shutting down.")
+    log(SUCCESS, "\nAll data transferred successfully! Selective Repeat completed.")
 
 if __name__ == "__main__":
     start_client()

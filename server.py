@@ -1,26 +1,24 @@
 import socket
 import random
-import time
 from datetime import datetime
 
-# --- ANSI Color Codes for Informative Output ---
+# --- ANSI Colors ---
 RESET = "\033[0m"
 INFO = "\033[94m"    # Blue
 SUCCESS = "\033[92m" # Green
 WARNING = "\033[93m" # Yellow
 ERROR = "\033[91m"   # Red
 
-# --- Configuration ---
-DROP_PROBABILITY = 0.20    # 20% chance to drop a packet
-CORRUPT_PROBABILITY = 0.15 # 15% chance to simulate a bit error
+# --- Config ---
+DROP_PROBABILITY = 0.20
+CORRUPT_PROBABILITY = 0.15
+WINDOW_SIZE = 4
 
 def log(level, message):
-    """Prints a timestamped, color-coded log message."""
     timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     print(f"[{timestamp}] {level}{message}{RESET}")
 
 def compute_checksum(data):
-    """Computes a simple checksum by summing the ASCII values of the characters."""
     return sum(ord(c) for c in data) % 256
 
 def start_server():
@@ -28,60 +26,57 @@ def start_server():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(server_address)
     
-    expected_seq = 0
-    log(INFO, f"RDT 3.0 Server started on {server_address[0]}:{server_address[1]}")
-    log(INFO, f"Simulating Network: Drop Rate={DROP_PROBABILITY*100}%, Corrupt Rate={CORRUPT_PROBABILITY*100}%")
+    rcv_base = 0
+    buffer = {} # Dictionary to store out-of-order packets
+
+    log(INFO, f"Selective Repeat Server started. Window Size: {WINDOW_SIZE}")
     print("-" * 60)
 
     while True:
         packet, client_address = sock.recvfrom(1024)
         data = packet.decode()
-        
-        # 1. Simulate Network Packet Loss
+
+        # Simulate network failures
         if random.random() < DROP_PROBABILITY:
-            log(ERROR, "[NETWORK] Packet dropped entirely. Silence...")
+            log(ERROR, "[NETWORK] Packet dropped entirely.")
             continue
 
-        # Parse the packet: "SEQ|CHECKSUM|PAYLOAD"
         try:
-            seq_str, checksum_str, msg = data.split('|', 2)
+            seq_str, chk_str, msg = data.split('|', 2)
             seq_num = int(seq_str)
-            received_checksum = int(checksum_str)
+            received_chk = int(chk_str)
         except ValueError:
-            log(ERROR, "[SERVER] Received malformed packet format.")
             continue
 
-        # 2. Simulate Data Corruption (Bit Errors)
         if random.random() < CORRUPT_PROBABILITY:
-            log(WARNING, f"[NETWORK] Packet {seq_num} got corrupted in transit!")
-            received_checksum = -1 # Force a checksum failure
+            log(WARNING, f"[NETWORK] Packet {seq_num} corrupted!")
+            received_chk = -1 
 
-        # 3. Verify Checksum
-        calculated_checksum = compute_checksum(msg)
-        is_corrupted = (received_checksum != calculated_checksum)
+        if compute_checksum(msg) != received_chk:
+            log(ERROR, f"[SERVER] Checksum failed for SEQ {seq_num}. Dropping packet.")
+            continue # In Selective Repeat, we do NOT send duplicate ACKs for corruption. We stay silent.
 
-        if is_corrupted:
-            log(ERROR, f"[SERVER] Checksum failed for SEQ {seq_num}. Expected {calculated_checksum}, got {received_checksum}. Ignoring packet.")
-            # RDT 3.0 reaction to corruption: Send ACK for the *previous* successful sequence
-            # This triggers a duplicate ACK on the sender side, forcing a timeout/retransmit
-            prev_seq = 1 - expected_seq
-            log(INFO, f"[SERVER] Sending duplicate ACK {prev_seq} to force retransmission.")
-            sock.sendto(str(prev_seq).encode(), client_address)
-            continue
-
-        # 4. Process Sequence Numbers
-        if seq_num == expected_seq:
-            log(SUCCESS, f"[SERVER] Valid packet received (SEQ {seq_num}): '{msg}'")
-            log(SUCCESS, f"[SERVER] Sending ACK {seq_num}")
+        # Packet is pristine. Check where it falls in our window.
+        if rcv_base <= seq_num < rcv_base + WINDOW_SIZE:
+            log(INFO, f"[SERVER] Sending ACK {seq_num}")
             sock.sendto(str(seq_num).encode(), client_address)
-            expected_seq = 1 - expected_seq # Toggle 0 <-> 1
-        else:
-            log(WARNING, f"[SERVER] Duplicate packet received (SEQ {seq_num}). Already processed.")
-            log(INFO, f"[SERVER] Re-sending ACK {seq_num} to help client recover.")
+
+            if seq_num not in buffer:
+                buffer[seq_num] = msg
+                log(WARNING, f"    -> Buffered out-of-order packet (SEQ {seq_num})")
+
+            # Deliver consecutive packets and slide window
+            if seq_num == rcv_base:
+                while rcv_base in buffer:
+                    log(SUCCESS, f"[SERVER] App Layer Delivery: '{buffer[rcv_base]}'")
+                    del buffer[rcv_base]
+                    rcv_base += 1
+                log(INFO, f"[SERVER] Window slid forward. New Base: {rcv_base}")
+
+        elif seq_num < rcv_base:
+            # Sender's previous ACK was lost. We must re-ACK it so sender can move on.
+            log(WARNING, f"[SERVER] Received old packet (SEQ {seq_num}). Re-sending ACK.")
             sock.sendto(str(seq_num).encode(), client_address)
 
 if __name__ == "__main__":
-    try:
-        start_server()
-    except KeyboardInterrupt:
-        print("\nServer shut down.")
+    start_server()
